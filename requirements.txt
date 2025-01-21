@@ -1,3 +1,4 @@
 flask==3.0.0
 gunicorn==21.2.0
 transformers==4.36.0
+torch>=2.0.0  # Allow any version of torch 2.0.0 or higher
