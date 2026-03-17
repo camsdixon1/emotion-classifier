@@ -195,6 +195,156 @@ Obsidian + Dataview plugin then becomes your read/query UI for free — no custo
 
 ---
 
+## Capture Methods — Keystrokes, Mouse, and Audio
+
+### Keystroke + Mouse Logging (Windows)
+
+**Library: `pynput`** — global keyboard/mouse hooks, runs in a background thread.
+
+What it captures:
+- Every key press and release
+- Mouse clicks: position (x, y) + which button
+- Scroll events
+- Mouse movement (usually too noisy — skip this)
+
+Combined with `win32gui` (pywin32), each event gets context:
+```
+14:32:07 | VS Code | auth.py       | typed "def validate_token(payload):"
+14:35:12 | Chrome  | github.com    | clicked [Submit PR]
+14:41:03 | Slack   | #eng-general  | typed "sounds good, merging now"
+```
+
+That context — "what app, what window, what was typed" — is what makes it useful. Raw keystrokes alone are useless.
+
+**Storage approach:** Don't log character by character. Buffer keystrokes per-window and flush on window switch. You get "this text was typed in this context" rather than a character stream.
+
+**Password protection (non-negotiable):**
+- Check if the focused control is a password field: `win32api.SendMessage(hwnd, EM_GETPASSWORDCHAR)` — returns non-zero if password field
+- Blacklist: password managers (1Password, Bitwarden), browser password prompts
+- When a password field is detected, log `[REDACTED]` and stop buffering until window changes
+- Do this before writing to DB, not after
+
+**Mouse clicks beyond coordinates:**
+Getting "what element was clicked" requires accessibility APIs (`UIAutomation` via `comtypes` or `pywinauto`). Gives you the control name/role/value. Useful but expensive — query on click, not continuously.
+
+**DB addition:**
+```sql
+CREATE TABLE input_events (
+  id           INTEGER PRIMARY KEY,
+  ts           TIMESTAMP NOT NULL,
+  type         TEXT NOT NULL,     -- 'keystroke_buffer' | 'mouse_click'
+  app_name     TEXT,
+  window_title TEXT,
+  url          TEXT,              -- if browser
+  text         TEXT,              -- buffered typed text, or NULL
+  click_x      INTEGER,
+  click_y      INTEGER,
+  element_name TEXT,              -- from UIAutomation, or NULL
+  redacted     INTEGER DEFAULT 0  -- 1 if password field was detected
+);
+```
+
+---
+
+### Audio Recording (Windows)
+
+Two separate streams, both needed:
+
+**1. Microphone — what you say**
+```python
+import sounddevice as sd
+# Default input device, 16kHz mono is enough for speech
+sd.rec(frames, samplerate=16000, channels=1, device=None)
+```
+
+**2. System audio (WASAPI loopback) — what you hear**
+
+This is the key for call capture. WASAPI loopback captures everything playing through your speakers — no virtual audio cable (VB-Cable, BlackHole) needed.
+
+```python
+import sounddevice as sd
+# Find WASAPI loopback device
+devices = sd.query_devices()
+loopback = next(d for d in devices if 'loopback' in d['name'].lower())
+sd.rec(frames, samplerate=16000, channels=2, device=loopback['index'])
+```
+
+With both streams, a Zoom/Teams/Meet/WhatsApp Web call captured as:
+- Mic stream → your voice
+- Loopback stream → the other person's voice
+- Merge and transcribe → full conversation, both sides
+
+**Voice Activity Detection (VAD) — don't record silence:**
+`silero-vad` (PyTorch, ~2MB model) detects speech in real time. Only write audio chunks to disk when speech is detected. Cuts storage by ~80% in typical use.
+
+**Storage format:**
+- Raw capture: 16kHz mono WAV
+- Compress immediately to Opus via ffmpeg: 1 hour ≈ 14MB vs 115MB uncompressed
+- Retention: keep compressed audio for 90 days, keep transcripts indefinitely
+- Raw WAV deleted after successful transcription
+
+**Triggered vs continuous recording:**
+
+| Mode | How | Use for |
+|---|---|---|
+| Continuous | Always on, VAD splits into segments | Ambient capture, ambient "what was said nearby" |
+| Meeting-triggered | Detect when Zoom/Teams/Discord opens, start recording, stop when it closes | Meetings — cleaner, no accidental captures |
+| Manual | Hotkey to start/stop | Voice notes |
+
+Meeting detection: watch for process names (`Zoom.exe`, `Teams.exe`, `Discord.exe`) appearing via `psutil`. When detected, start recording both streams automatically.
+
+---
+
+### Text / Messages
+
+Beyond keystrokes, "incoming and outgoing text" has several sources:
+
+| Source | How to capture | Effort |
+|---|---|---|
+| Email (Gmail) | Gmail API, poll inbox/sent | Light — OAuth + API |
+| Email (Outlook) | Microsoft Graph API | Light — OAuth + API |
+| SMS (Android) | SMS Backup & Restore app → XML → parse | Light |
+| iMessage | Mac only — SQLite at `~/Library/Messages/chat.db` | Light (Mac) |
+| WhatsApp | Encrypted — no clean API. Export chat manually or use WhatsApp Business API | Hard |
+| Slack | Slack API, your own messages + DMs | Light — API token |
+| Discord | Discord API (unofficial) — fragile | Medium |
+| Teams chat | Microsoft Graph API | Light |
+
+Practical starting point: Gmail + SMS export. Cover the highest-volume channels first.
+
+**DB addition for messages:**
+```sql
+CREATE TABLE messages (
+  id          INTEGER PRIMARY KEY,
+  ts          TIMESTAMP NOT NULL,
+  platform    TEXT NOT NULL,     -- 'email' | 'sms' | 'slack' | 'imessage'
+  direction   TEXT NOT NULL,     -- 'inbound' | 'outbound'
+  person_id   INTEGER REFERENCES people(id),
+  contact_raw TEXT,              -- raw "From" / "To" before person is resolved
+  subject     TEXT,              -- email subject, or NULL
+  body        TEXT NOT NULL,
+  thread_id   TEXT,              -- platform's thread/conversation ID
+  enriched    INTEGER DEFAULT 0
+);
+```
+
+---
+
+### Android Audio
+
+The honest picture:
+
+| Method | What it captures | Requirement |
+|---|---|---|
+| BCR (Basic Call Recorder) | Both sides of phone calls | Root (Android 10+) |
+| Built-in call recording | Both sides | Samsung/Xiaomi/some OEMs only |
+| Accessibility service recording | Mic only (your side) | No root, but fragile + often breaks |
+| VoIP via PC (WhatsApp Web, etc.) | Both sides via WASAPI loopback | No root — just use PC client |
+
+**Best no-root strategy:** Route as many calls as possible through PC clients (WhatsApp Web, Google Voice, Telegram Desktop) and let the PC audio pipeline capture them. For native phone calls, either root or accept you'll only get your side.
+
+---
+
 ## Honest Hard Parts
 
 1. **Android call recording** — requires root (BCR app). Without root, calls are very hard to capture. Fallback: voice recorder app + manual drop to folder.
