@@ -57,7 +57,7 @@ class AudioPipeline:
         try:
             _pa_test = _tmp_pa.PyAudio()
             device_count = _pa_test.get_device_count()
-            _pa_test.terminate()
+            # Note: skip _pa_test.terminate() — it SIGABRTs on PulseAudio
         except Exception:
             device_count = 0
 
@@ -194,10 +194,6 @@ class AudioPipeline:
         # Check there are any audio devices before trying to open a stream
         if pa.get_device_count() == 0:
             print(f"[audio] {source}: no audio devices found")
-            try:
-                pa.terminate()
-            except Exception:
-                pass
             return
 
         try:
@@ -208,18 +204,15 @@ class AudioPipeline:
                 stream = self._open_loopback_stream(pa)
                 vad = self._vad_loopback
                 if stream is None:
-                    try:
-                        pa.terminate()
-                    except Exception:
-                        pass
                     return
         except Exception as e:
             print(f"[audio] {source}: failed to open stream — {e}")
-            try:
-                pa.terminate()
-            except Exception:
-                pass
             return
+
+        # Don't hold a reference to pa after this point — calling pa.terminate()
+        # on PulseAudio-backed PyAudio raises SIGABRT; daemon threads exit with
+        # the process anyway so this is safe to skip.
+        del pa
 
         native_rate = getattr(stream, "_native_rate", SAMPLE_RATE)
         native_channels = getattr(stream, "_native_channels", CHANNELS)
@@ -288,9 +281,11 @@ class AudioPipeline:
                     speech_start = datetime.now().isoformat()
                     speech_buffer = []
 
-        stream.stop_stream()
-        stream.close()
-        pa.terminate()
+        try:
+            stream.stop_stream()
+            stream.close()
+        except Exception:
+            pass
 
     def _transcribe_worker(self):
         """Drain the transcription queue — run whisper on each segment."""

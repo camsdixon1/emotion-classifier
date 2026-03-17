@@ -93,6 +93,7 @@ class InputCapture:
         threading.Thread(target=self._flush_timer, daemon=True, name="flush-timer").start()
 
         from pynput import keyboard, mouse
+        self._keyboard = keyboard
         self._key_listener = keyboard.Listener(on_press=self._on_key_press)
         self._mouse_listener = mouse.Listener(on_click=self._on_mouse_click)
         self._key_listener.start()
@@ -102,8 +103,10 @@ class InputCapture:
     def stop(self):
         self._running = False
         self._flush_buffer()
-        self._key_listener.stop()
-        self._mouse_listener.stop()
+        if hasattr(self, "_key_listener"):
+            self._key_listener.stop()
+        if hasattr(self, "_mouse_listener"):
+            self._mouse_listener.stop()
 
     # --- Callbacks (MUST NOT BLOCK) ---
 
@@ -145,13 +148,14 @@ class InputCapture:
                     char = key.char  # regular character
                 except AttributeError:
                     # Special key
-                    if key == keyboard.Key.space:
+                    kb = self._keyboard
+                    if key == kb.Key.space:
                         char = " "
-                    elif key == keyboard.Key.enter:
+                    elif key == kb.Key.enter:
                         char = "\n"
-                    elif key == keyboard.Key.tab:
+                    elif key == kb.Key.tab:
                         char = "\t"
-                    elif key == keyboard.Key.backspace:
+                    elif key == kb.Key.backspace:
                         char = "[BS]"
                     else:
                         char = f"[{key.name}]"
