@@ -2,7 +2,9 @@
 
 ## What We're Building
 
-A local, always-on background service that records everything you do on PC and Android, stores it in a structured SQLite database, and lets you search/filter your life by person, date, or activity type. Think of it as a personal memory layer — "what was I working on Tuesday?" or "all my interactions with John last month."
+A local, always-on background service that records everything you do on your PC, stores it in a structured SQLite database, and lets you search/filter by person, date, or activity type. Personal memory layer — "what was I working on Tuesday?" or "all my interactions with John last month."
+
+**Scope: PC (Windows) only for now.**
 
 ---
 
@@ -11,7 +13,6 @@ A local, always-on background service that records everything you do on PC and A
 - **Daily review** — what did I actually work on today?
 - **Person-centric memory** — everything I discussed with a specific contact
 - **Audio/call history** — searchable transcripts of calls and meetings
-- **Note integration** — link notes written in Obsidian/markdown to people and events
 - **Pattern awareness** — where is my time actually going?
 
 ---
@@ -19,349 +20,425 @@ A local, always-on background service that records everything you do on PC and A
 ## Architecture
 
 ```
-CAPTURE                         INGEST                          STORE
-───────                         ──────                          ─────
-Screenshot daemon (every 5min)  →  screenshot_ingestor.py   →  events table
-ActivityWatch (app/window)      →  activitywatch_ingestor.py →  events table
-Audio drop folder               →  audio_ingestor.py        →  transcripts table
-Obsidian vault (file watcher)   →  vault_ingestor.py        →  notes table (later)
+INSTALL & RUN (zero custom code)
+────────────────────────────────
+Screenpipe (headless binary)   →  screen OCR + audio STT  →  REST API localhost:3030
+ActivityWatch                  →  app/window/URL time      →  REST API localhost:5600
 
-ENRICH (separate pass, async)
+CUSTOM PYTHON SERVICE
+─────────────────────
+keystroke_ingestor.py          →  pynput hooks + win32gui context  →  SQLite
+screenshot_ingestor.py         →  mss capture → Claude Vision      →  SQLite
+screenpipe_poller.py           →  polls localhost:3030              →  SQLite
+activitywatch_poller.py        →  polls localhost:5600              →  SQLite
+audio_recorder.py              →  PyAudioWPatch loopback + mic      →  SQLite
+                                  + silero-vad + faster-whisper
+
+ENRICH (separate async pass)
 ─────────────────────────────
-enrich.py  →  reads enriched=0  →  calls Claude Haiku Vision  →  writes summary back
+enrich.py  →  reads enriched=0  →  Claude Haiku  →  writes summary back
 
 UI (later)
 ──────────
-Simple web UI or Obsidian + Dataview for querying
+Obsidian + Dataview plugin for querying, or simple local web page
 Review queue — assign transcripts to people
 ```
 
-**Key principle:** Ingestion and enrichment are fully decoupled. If Claude's API is down, ingestion keeps running. Nothing is lost.
+**Key principle:** Ingestion and enrichment are fully decoupled. Raw data always gets written first. If Claude's API is down, enrichment stalls but nothing is lost.
 
 ---
 
 ## V1 Scope (Start Here)
 
-1. **DB setup** — 3 tables, SQLite WAL mode, single writer
-2. **Screenshot ingestor** — capture every 5 min, write raw to `events`
-3. **ActivityWatch ingestor** — poll localhost:5600, write raw JSON to `events`
-4. **Audio ingestor** — watch a folder, run faster-whisper, write to `transcripts`
-5. **Enrich pass** — separate process, reads `enriched=0`, calls Claude, writes summary
-6. **Review queue v1** — list unreviewed transcripts, type a person's name, link and mark done
+1. **DB setup** — schema below, SQLite WAL mode, single-writer queue pattern
+2. **Screenpipe** — install headless binary, poll its REST API for OCR + STT events
+3. **ActivityWatch** — install, poll localhost:5600 for app/URL data via `aw-client`
+4. **Keystroke ingestor** — pynput + win32gui context + password redaction
+5. **Audio recorder** — PyAudioWPatch (loopback + mic) + silero-vad + faster-whisper
+6. **Enrich pass** — async Claude summarization of raw events
+7. **Review queue v1** — list unreviewed transcripts, type a person's name, done
 
 Everything else comes after real data is flowing.
 
 ---
 
-## Database Schema (V1 — minimal, intentionally sparse)
+## Database Schema
+
+### Design principles
+- Single SQLite file, WAL mode
+- **One writer thread only** — all writes go through a `queue.Queue` consumed by a single thread. Never share one connection across threads. Set `PRAGMA busy_timeout=5000` on reader connections.
+- Raw data stored first, enrichment happens in a separate pass
+- FTS5 for full-text search — built into Python's SQLite, no extra install
+- sqlite-vec for semantic/vector search (bolt-on extension, optional)
+- DuckDB can query the SQLite file directly for complex analytics — no migration needed
 
 ```sql
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+
+-- All activity events in one table
 CREATE TABLE events (
-  id        INTEGER PRIMARY KEY,
-  ts        TIMESTAMP NOT NULL,
-  source    TEXT NOT NULL,       -- 'screenshot' | 'activitywatch'
-  raw       TEXT NOT NULL,       -- raw JSON/data from source, untouched
-  enriched  INTEGER DEFAULT 0,   -- 0 = needs processing, 1 = done
-  error     TEXT                 -- non-null if enrichment failed
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_start    TEXT NOT NULL,      -- ISO8601
+    ts_end      TEXT,               -- nullable for point events
+    event_type  TEXT NOT NULL,      -- 'window_focus' | 'screenshot' | 'transcript' | 'keystroke_burst' | 'message'
+    source      TEXT NOT NULL,      -- 'screenpipe' | 'activitywatch' | 'custom'
+    exe         TEXT,
+    window_title TEXT,
+    url         TEXT,
+    raw         TEXT,               -- raw JSON from source, untouched
+    enriched    INTEGER DEFAULT 0,  -- 0 = pending, 1 = done
+    error       TEXT                -- non-null if enrichment failed
 );
 
+-- Keystroke bursts (buffered per-window, not per-key)
+CREATE TABLE input_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id        INTEGER REFERENCES events(id),
+    keycount        INTEGER,
+    mouseclick_count INTEGER,
+    content         TEXT,           -- buffered typed text
+    redacted        INTEGER DEFAULT 0  -- 1 if password field detected
+);
+
+-- Screenshots (from mss capture, separate from Screenpipe)
+CREATE TABLE screenshots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    INTEGER REFERENCES events(id),
+    file_path   TEXT,
+    ocr_text    TEXT,
+    summary     TEXT                -- Claude Vision output
+);
+
+-- Audio transcripts (from faster-whisper via our recorder, or from Screenpipe)
 CREATE TABLE transcripts (
-  id         INTEGER PRIMARY KEY,
-  ts         TIMESTAMP NOT NULL,
-  source     TEXT,               -- 'call' | 'meeting' | 'voice_note'
-  audio_path TEXT,
-  raw_text   TEXT,               -- raw whisper output, nothing more
-  summary    TEXT,               -- filled in by enrich pass
-  enriched   INTEGER DEFAULT 0,
-  error      TEXT
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,
+    source      TEXT,               -- 'mic' | 'loopback' | 'meeting' | 'screenpipe'
+    audio_path  TEXT,
+    raw_text    TEXT,               -- raw whisper output
+    summary     TEXT,               -- Claude summary (filled by enrich pass)
+    enriched    INTEGER DEFAULT 0,
+    error       TEXT
 );
 
+-- Messages (email, Slack, etc. — added in later phase)
+CREATE TABLE messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,
+    platform    TEXT,               -- 'gmail' | 'slack' | 'sms'
+    direction   TEXT,               -- 'inbound' | 'outbound'
+    contact_raw TEXT,               -- raw From/To before person resolved
+    subject     TEXT,
+    body        TEXT,
+    thread_id   TEXT,
+    enriched    INTEGER DEFAULT 0
+);
+
+-- People
 CREATE TABLE people (
-  id    INTEGER PRIMARY KEY,
-  name  TEXT NOT NULL,
-  notes TEXT
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    notes           TEXT,
+    last_seen       TEXT,
+    interaction_count INTEGER DEFAULT 0,
+    created_at      TEXT DEFAULT (datetime('now'))
 );
 
--- Links transcripts to people (added after review queue)
+-- Transcript ↔ People
 CREATE TABLE transcript_people (
-  transcript_id INTEGER REFERENCES transcripts(id),
-  person_id     INTEGER REFERENCES people(id),
-  PRIMARY KEY (transcript_id, person_id)
+    transcript_id   INTEGER REFERENCES transcripts(id),
+    person_id       INTEGER REFERENCES people(id),
+    PRIMARY KEY (transcript_id, person_id)
 );
 
 -- Indexes
-CREATE INDEX idx_events_ts        ON events(ts);
-CREATE INDEX idx_events_enriched  ON events(enriched);
-CREATE INDEX idx_transcripts_enr  ON transcripts(enriched);
+CREATE INDEX idx_events_ts       ON events(ts_start);
+CREATE INDEX idx_events_type     ON events(event_type);
+CREATE INDEX idx_events_enriched ON events(enriched);
+CREATE INDEX idx_events_exe      ON events(exe);
+CREATE INDEX idx_transcripts_enr ON transcripts(enriched);
+CREATE INDEX idx_tp_person       ON transcript_people(person_id);
+
+-- FTS5 full-text search (contentless — populate manually on insert)
+CREATE VIRTUAL TABLE search_fts USING fts5(
+    window_title,
+    ocr_text,
+    transcript_text,
+    message_text,
+    content='',
+    tokenize='unicode61'
+);
 ```
 
-Schema evolves only when real data shows a column is needed.
+**Inserting into FTS on write:**
+```python
+db.execute("""
+    INSERT INTO search_fts(rowid, window_title, ocr_text, transcript_text, message_text)
+    VALUES (?, ?, ?, ?, ?)
+""", (event_id, title, ocr, transcript, message))
+```
+
+**Querying FTS:**
+```sql
+-- Simple
+SELECT rowid, rank FROM search_fts WHERE search_fts MATCH 'budget meeting' ORDER BY rank;
+-- Phrase
+SELECT rowid FROM search_fts WHERE search_fts MATCH '"quarterly review"';
+-- Column-specific
+SELECT rowid FROM search_fts WHERE search_fts MATCH 'transcript_text: John';
+```
+
+**DuckDB analytical queries on top of SQLite (no migration):**
+```python
+import duckdb
+conn = duckdb.connect()
+conn.execute("INSTALL sqlite; LOAD sqlite;")
+conn.execute("ATTACH 'logger.db' AS logger (TYPE sqlite)")
+results = conn.execute("""
+    SELECT exe, SUM(CAST(ts_end AS FLOAT) - CAST(ts_start AS FLOAT)) / 3600 as hours
+    FROM logger.events
+    WHERE ts_start > (datetime('now', '-7 days'))
+    GROUP BY exe ORDER BY hours DESC
+""").fetchall()
+```
 
 ---
 
-## Tech Stack
+## Tool Decisions (Research-Backed)
 
-| Layer | Tool | Notes |
+### Screen + Audio: Use Screenpipe headless
+
+- Run the MIT-licensed Rust binary headlessly — no desktop app, no $400 license needed
+- Captures screen OCR + audio STT automatically, stores in its own SQLite
+- Query from Python via REST: `GET http://localhost:3030/search?contentType=ocr&startTime=...`
+- **No Python SDK** — use `httpx` or `requests` to poll the REST API
+- API is not versioned — watch for field changes on upgrades
+
+### App/Window/URL: ActivityWatch + aw-client
+
+```python
+pip install aw-client
+```
+```python
+from aw_client import ActivityWatchClient
+client = ActivityWatchClient("lifelogger")
+events = client.get_events("aw-watcher-window_hostname", limit=100)
+```
+- Browser URL requires the `aw-watcher-web` browser extension to be installed
+
+### Screenshots: mss (fastest Python option)
+
+```python
+pip install mss
+```
+- ~3ms per full-screen capture vs ~100ms for PIL.ImageGrab
+- Thread-safe, no runtime dependencies
+- Use for our own periodic screenshot pipeline separate from Screenpipe
+
+### Keystroke + Mouse: pynput (critical gotcha)
+
+```python
+pip install pynput pywin32 psutil
+```
+
+**The most important pynput rule:** The OS hook callback runs on the Windows input thread. **It must never block.** Dispatching to a queue is mandatory — any slow work (disk write, API call) done directly in the callback will stall system-wide input.
+
+```python
+from pynput import keyboard
+import queue
+
+q = queue.Queue()
+
+def on_press(key):
+    try:
+        q.put_nowait(key)   # never block here
+    except Exception:
+        pass                 # swallow silently — never let the callback raise
+```
+
+A separate worker thread drains the queue, combines with `win32gui.GetForegroundWindow()` context, and writes to DB.
+
+**Getting URL from browser:** Use `uiautomation` package (not `comtypes` directly — it's a higher-level wrapper). The Chrome/Edge address bar is a named UIAutomation element.
+```python
+pip install uiautomation
+```
+
+**Password field detection (two layers):**
+```python
+import win32gui, win32con, uiautomation as auto
+
+def is_sensitive(hwnd):
+    # Layer 1: Win32 ES_PASSWORD style flag (works for native apps)
+    style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+    if style & 0x0020:
+        return True
+    # Layer 2: UIA IsPassword property (works for browsers + modern apps)
+    focused = auto.GetFocusedControl()
+    if getattr(focused, 'IsPassword', False):
+        return True
+    return False
+```
+Also maintain a process name blacklist: `1Password.exe`, `Bitwarden.exe`, `KeePass.exe`.
+
+### Audio: PyAudioWPatch (NOT sounddevice)
+
+**sounddevice does not support WASAPI loopback.** This is a known limitation — it wraps stock PortAudio which lacks loopback. Use PyAudioWPatch instead:
+
+```python
+pip install PyAudioWPatch
+```
+
+PyAudioWPatch is a drop-in PyAudio replacement that ships a PortAudio build with WASAPI loopback support. Windows-only, Python 3.7–3.13, wheels available.
+
+Finding the loopback device:
+```python
+import pyaudiowpatch as pyaudio
+
+with pyaudio.PyAudio() as p:
+    wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+    default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+    for i in range(p.get_device_count()):
+        dev = p.get_device_info_by_index(i)
+        if dev["name"] == default_speakers["name"] + " [Loopback]":
+            loopback_device = dev
+            break
+```
+
+Use PyAudioWPatch for both mic (input) and loopback (system audio). Two separate streams, merged for transcription.
+
+### Voice Activity Detection: silero-vad
+
+```python
+pip install silero-vad
+```
+
+- ~1.8MB model, processes 32ms chunks in <1ms on CPU
+- Feed 512 samples at a time (at 16kHz), get back speech start/end events
+- **Buffer audio only during detected speech segments** — send completed utterances to Whisper
+- Call `vad_iterator.reset_states()` between separate audio streams
+- Reduces storage by ~80% vs recording continuously
+
+### Transcription: faster-whisper
+
+```python
+pip install faster-whisper
+```
+
+| Model | RAM (INT8 CPU) | Use for |
 |---|---|---|
-| Screenshots | `mss` + `Pillow` | Python, cross-platform |
-| Screen understanding | Claude Haiku Vision API | Fast + cheap, ~$0.01/day at 5min intervals |
-| App/browser tracking | ActivityWatch | REST API at localhost:5600, has Python client |
-| Audio transcription | `faster-whisper` | Local, no internet needed |
-| Speaker diarization | `WhisperX` + `pyannote` | "Who said what" — later, needs GPU |
-| Storage | SQLite (WAL mode) | Single file, zero infra |
-| Scheduling | `APScheduler` | With job failure logging |
-| AI enrichment | Claude Haiku / Sonnet | Async, decoupled from ingest |
-| Notes | Obsidian or built-in markdown | Vault = folder of .md files, watched by file watcher |
-| Mobile | ActivityWatch Android + BCR (rooted) | Android only — iOS is a dead end |
+| tiny | ~300 MB | Testing only |
+| base | ~500 MB | Quick notes, high CPU budget |
+| medium | ~2 GB | **Sweet spot** — good accuracy, practical on CPU |
+| large-v3 | ~4 GB | Best accuracy, needs 8GB+ RAM |
 
----
-
-## AI / Vision Pricing (as of March 2026)
-
-For screenshot classification (Claude Haiku Vision — fast + cheap is the right call here):
-
-| Provider | Model | Input (per 1M tokens) | Output (per 1M tokens) |
-|---|---|---|---|
-| Anthropic | Claude Haiku | ~$0.80 | ~$4.00 |
-| OpenAI | GPT-4o mini | ~$0.15 | ~$0.60 |
-| xAI | Grok 2 Vision | $2.00 | $10.00 |
-| Groq | (no vision model at scale) | — | — |
-
-At a screenshot every 5 minutes, cost is pennies per day on any provider. GPT-4o mini is cheapest; Claude Haiku is slightly more but better at understanding context. Either works.
-
----
-
-## Deployment — Local, Always-On
-
-Everything runs locally on your Windows PC. The service boots on startup and runs silently in the background.
-
-```
-Windows startup (Task Scheduler or systemd-equivalent)
-  └── Python service (runs headlessly)
-        ├── screenshot_ingestor.py    (every 5 min)
-        ├── activitywatch_ingestor.py (every 1 min)
-        ├── audio_ingestor.py         (watches drop folder)
-        ├── enrich.py                 (every 10 min, async)
-        └── Web UI at localhost:8080  (review queue, search)
+```python
+from faster_whisper import WhisperModel
+model = WhisperModel("medium", device="cpu", compute_type="int8")
+segments, info = model.transcribe("chunk.wav", beam_size=5)
 ```
 
-Later: wrap in a system tray icon (`pystray`) for pause/resume and status.
+No FFmpeg needed. No GPU required (CPU INT8 mode).
 
-**On-startup options (Windows):**
-- Task Scheduler (simplest — run `python main.py` on login)
-- NSSM (Non-Sucking Service Manager) — runs as a proper Windows service, survives logout
-- Startup folder shortcut — fine for dev, not robust enough for always-on
+### Meeting Detection: psutil
+
+```python
+import psutil
+
+MEETING_PROCESSES = {"Zoom.exe", "Teams.exe", "ms-teams.exe", "CiscoCollabHost.exe", "slack.exe"}
+
+def is_in_meeting():
+    running = {p.info['name'] for p in psutil.process_iter(['name'])}
+    return bool(running & MEETING_PROCESSES)
+```
+
+When a meeting process is detected: start recording both audio streams automatically.
+
+### Search Layers
+
+| Need | Tool | Notes |
+|---|---|---|
+| Full-text (keyword) | SQLite FTS5 | Built in, zero setup, fast |
+| Vector/semantic | sqlite-vec | Bolt-on extension, brute-force KNN, fine under 1M vectors |
+| Analytics/aggregations | DuckDB | Queries the SQLite file directly, no migration |
+| Hybrid search | LanceDB | If sqlite-vec isn't enough — separate store with HNSW index |
 
 ---
 
-## What Doesn't Exist Yet (Custom Build Required)
+## What Already Exists vs What to Build
 
-| Feature | Effort |
+| Capability | Approach |
 |---|---|
-| Screenshot daemon + Claude Vision pipeline | ~40 lines Python |
-| ActivityWatch poller | ~30 lines Python |
-| Audio folder watcher + Whisper | ~60 lines Python |
-| Enrich/summarize pass | ~50 lines Python |
-| Transcript review queue UI | ~100 lines (simple HTML) |
-| Obsidian vault file watcher | ~40 lines Python |
-| Obsidian daily note writer | ~50 lines Python |
-
-Total custom code for v1: ~400 lines.
-
----
-
-## What Already Exists (Use As-Is)
-
-- **Screenpipe** — full screen + audio capture, OCR, Whisper transcription, REST API. Consider as an alternative/complement to rolling our own screenshot daemon.
-- **ActivityWatch** — mature, just install it and poll the API.
-- **faster-whisper** — pip install, works locally.
-- **Khoj** — self-hosted semantic search over Obsidian vault (add later).
-- **Meetily** — local meeting transcription with Markdown output (add later).
+| Screen OCR + audio STT | **Install Screenpipe headless**, poll REST API |
+| App/window/URL time | **Install ActivityWatch**, poll via aw-client |
+| Browser URL extraction | **Install aw-watcher-web** extension (ActivityWatch handles it) |
+| Keystroke + mouse context | **Build** — pynput + win32gui queue pattern |
+| Audio loopback capture | **Build** — PyAudioWPatch + silero-vad + faster-whisper |
+| Password redaction | **Build** — Win32 ES_PASSWORD + UIA IsPassword |
+| Meeting auto-trigger | **Build** — psutil process watcher (trivial) |
+| Full-text search | **SQLite FTS5** — set up at schema creation time |
+| Semantic search | **sqlite-vec** — pip install + schema addition |
 
 ---
 
-## Obsidian Integration
-
-Your app writes `.md` files into the vault. Obsidian hot-reloads them instantly.
+## Project Structure
 
 ```
-vault/
-  daily-notes/2026-03-15.md   ← generated each morning by enrich.py
-  contacts/John-Smith.md      ← auto-updated after each interaction
-  weekly/2026-W11.md          ← weekly digest
-```
-
-Obsidian + Dataview plugin then becomes your read/query UI for free — no custom UI needed for most views.
-
----
-
-## Capture Methods — Keystrokes, Mouse, and Audio
-
-### Keystroke + Mouse Logging (Windows)
-
-**Library: `pynput`** — global keyboard/mouse hooks, runs in a background thread.
-
-What it captures:
-- Every key press and release
-- Mouse clicks: position (x, y) + which button
-- Scroll events
-- Mouse movement (usually too noisy — skip this)
-
-Combined with `win32gui` (pywin32), each event gets context:
-```
-14:32:07 | VS Code | auth.py       | typed "def validate_token(payload):"
-14:35:12 | Chrome  | github.com    | clicked [Submit PR]
-14:41:03 | Slack   | #eng-general  | typed "sounds good, merging now"
-```
-
-That context — "what app, what window, what was typed" — is what makes it useful. Raw keystrokes alone are useless.
-
-**Storage approach:** Don't log character by character. Buffer keystrokes per-window and flush on window switch. You get "this text was typed in this context" rather than a character stream.
-
-**Password protection (non-negotiable):**
-- Check if the focused control is a password field: `win32api.SendMessage(hwnd, EM_GETPASSWORDCHAR)` — returns non-zero if password field
-- Blacklist: password managers (1Password, Bitwarden), browser password prompts
-- When a password field is detected, log `[REDACTED]` and stop buffering until window changes
-- Do this before writing to DB, not after
-
-**Mouse clicks beyond coordinates:**
-Getting "what element was clicked" requires accessibility APIs (`UIAutomation` via `comtypes` or `pywinauto`). Gives you the control name/role/value. Useful but expensive — query on click, not continuously.
-
-**DB addition:**
-```sql
-CREATE TABLE input_events (
-  id           INTEGER PRIMARY KEY,
-  ts           TIMESTAMP NOT NULL,
-  type         TEXT NOT NULL,     -- 'keystroke_buffer' | 'mouse_click'
-  app_name     TEXT,
-  window_title TEXT,
-  url          TEXT,              -- if browser
-  text         TEXT,              -- buffered typed text, or NULL
-  click_x      INTEGER,
-  click_y      INTEGER,
-  element_name TEXT,              -- from UIAutomation, or NULL
-  redacted     INTEGER DEFAULT 0  -- 1 if password field was detected
-);
+lifelogger/
+  db.py                     # SQLite setup, WAL, single-writer queue, FTS helpers
+  ingest/
+    screenpipe_poller.py    # polls localhost:3030, writes to events + transcripts
+    activitywatch_poller.py # polls localhost:5600 via aw-client, writes to events
+    keystroke_ingestor.py   # pynput + win32gui context + password redaction
+    audio_recorder.py       # PyAudioWPatch + silero-vad + faster-whisper
+    screenshot_ingestor.py  # mss + Claude Vision (optional, Screenpipe may cover this)
+  enrich.py                 # async pass: reads enriched=0, calls Claude, writes back
+  scheduler.py              # APScheduler with job failure logging
+  main.py                   # boots everything, handles shutdown
 ```
 
 ---
 
-### Audio Recording (Windows)
+## Deployment — Local, Always-On (Windows)
 
-Two separate streams, both needed:
-
-**1. Microphone — what you say**
-```python
-import sounddevice as sd
-# Default input device, 16kHz mono is enough for speech
-sd.rec(frames, samplerate=16000, channels=1, device=None)
+```
+Windows startup
+  └── NSSM (Non-Sucking Service Manager) wraps: python main.py
+        ├── Screenpipe headless binary (separate service)
+        ├── ActivityWatch aw-server (separate service)
+        └── lifelogger Python service
+              ├── screenpipe_poller   (every 60s)
+              ├── activitywatch_poller (every 30s)
+              ├── keystroke_ingestor  (continuous, event-driven)
+              ├── audio_recorder      (continuous with VAD)
+              └── enrich.py           (every 10 min)
 ```
 
-**2. System audio (WASAPI loopback) — what you hear**
-
-This is the key for call capture. WASAPI loopback captures everything playing through your speakers — no virtual audio cable (VB-Cable, BlackHole) needed.
-
-```python
-import sounddevice as sd
-# Find WASAPI loopback device
-devices = sd.query_devices()
-loopback = next(d for d in devices if 'loopback' in d['name'].lower())
-sd.rec(frames, samplerate=16000, channels=2, device=loopback['index'])
-```
-
-With both streams, a Zoom/Teams/Meet/WhatsApp Web call captured as:
-- Mic stream → your voice
-- Loopback stream → the other person's voice
-- Merge and transcribe → full conversation, both sides
-
-**Voice Activity Detection (VAD) — don't record silence:**
-`silero-vad` (PyTorch, ~2MB model) detects speech in real time. Only write audio chunks to disk when speech is detected. Cuts storage by ~80% in typical use.
-
-**Storage format:**
-- Raw capture: 16kHz mono WAV
-- Compress immediately to Opus via ffmpeg: 1 hour ≈ 14MB vs 115MB uncompressed
-- Retention: keep compressed audio for 90 days, keep transcripts indefinitely
-- Raw WAV deleted after successful transcription
-
-**Triggered vs continuous recording:**
-
-| Mode | How | Use for |
-|---|---|---|
-| Continuous | Always on, VAD splits into segments | Ambient capture, ambient "what was said nearby" |
-| Meeting-triggered | Detect when Zoom/Teams/Discord opens, start recording, stop when it closes | Meetings — cleaner, no accidental captures |
-| Manual | Hotkey to start/stop | Voice notes |
-
-Meeting detection: watch for process names (`Zoom.exe`, `Teams.exe`, `Discord.exe`) appearing via `psutil`. When detected, start recording both streams automatically.
-
----
-
-### Text / Messages
-
-Beyond keystrokes, "incoming and outgoing text" has several sources:
-
-| Source | How to capture | Effort |
-|---|---|---|
-| Email (Gmail) | Gmail API, poll inbox/sent | Light — OAuth + API |
-| Email (Outlook) | Microsoft Graph API | Light — OAuth + API |
-| SMS (Android) | SMS Backup & Restore app → XML → parse | Light |
-| iMessage | Mac only — SQLite at `~/Library/Messages/chat.db` | Light (Mac) |
-| WhatsApp | Encrypted — no clean API. Export chat manually or use WhatsApp Business API | Hard |
-| Slack | Slack API, your own messages + DMs | Light — API token |
-| Discord | Discord API (unofficial) — fragile | Medium |
-| Teams chat | Microsoft Graph API | Light |
-
-Practical starting point: Gmail + SMS export. Cover the highest-volume channels first.
-
-**DB addition for messages:**
-```sql
-CREATE TABLE messages (
-  id          INTEGER PRIMARY KEY,
-  ts          TIMESTAMP NOT NULL,
-  platform    TEXT NOT NULL,     -- 'email' | 'sms' | 'slack' | 'imessage'
-  direction   TEXT NOT NULL,     -- 'inbound' | 'outbound'
-  person_id   INTEGER REFERENCES people(id),
-  contact_raw TEXT,              -- raw "From" / "To" before person is resolved
-  subject     TEXT,              -- email subject, or NULL
-  body        TEXT NOT NULL,
-  thread_id   TEXT,              -- platform's thread/conversation ID
-  enriched    INTEGER DEFAULT 0
-);
-```
-
----
-
-### Android Audio
-
-The honest picture:
-
-| Method | What it captures | Requirement |
-|---|---|---|
-| BCR (Basic Call Recorder) | Both sides of phone calls | Root (Android 10+) |
-| Built-in call recording | Both sides | Samsung/Xiaomi/some OEMs only |
-| Accessibility service recording | Mic only (your side) | No root, but fragile + often breaks |
-| VoIP via PC (WhatsApp Web, etc.) | Both sides via WASAPI loopback | No root — just use PC client |
-
-**Best no-root strategy:** Route as many calls as possible through PC clients (WhatsApp Web, Google Voice, Telegram Desktop) and let the PC audio pipeline capture them. For native phone calls, either root or accept you'll only get your side.
+All data in: `C:\Users\{user}\lifelogger\logger.db` + audio files in `C:\Users\{user}\lifelogger\audio\`
 
 ---
 
 ## Honest Hard Parts
 
-1. **Android call recording** — requires root (BCR app). Without root, calls are very hard to capture. Fallback: voice recorder app + manual drop to folder.
-2. **iOS** — essentially impossible for background recording. Workaround: screen mirror to Mac via Continuity.
-3. **Person identification from audio** — automated speaker → person mapping needs `pyannote` embeddings. V1: manual tagging in review queue.
-4. **Data volume** — continuous screen capture generates a lot. Cap raw blobs at ~10KB, log oversized data separately, define retention policy before it fills a drive.
+1. **pynput callback blocking** — silent disaster. Must queue immediately, never do work in callback.
+2. **sounddevice doesn't do loopback** — use PyAudioWPatch. Easy fix once you know.
+3. **Browser URL via UIA** — works but requires target window to be visible/partially active. Edge cases exist.
+4. **Password detection coverage** — Win32 flag + UIA IsPassword covers most cases but not all. Maintain a process blacklist as fallback.
+5. **Screenpipe API changes** — not versioned, fields shift between releases. Pin the binary version.
+6. **Data volume** — Screenpipe generates ~5–10 GB/month of video chunks. Define retention before it fills a drive.
+7. **faster-whisper on CPU** — `medium` model is ~2x real-time on a modern CPU. Fine for post-processing meeting recordings, too slow for live continuous transcription. Use VAD to only transcribe actual speech.
 
 ---
 
 ## Build Order
 
 ```
-1. db.py                  — schema, WAL mode, single writer helper
-2. screenshot_ingestor.py — mss capture → Claude Haiku → events table
-3. activitywatch_ingestor.py — poll AW API → events table
-4. audio_ingestor.py      — watchdog on drop folder → faster-whisper → transcripts
-5. enrich.py              — async Claude summarization pass
-6. review_queue.html      — list transcripts, assign to person, mark done
-7. scheduler.py / main.py — boots everything, APScheduler with error logging
+1. db.py                      — schema, WAL, single-writer queue, FTS5 setup
+2. screenpipe_poller.py        — get Screenpipe running + poll its REST API
+3. activitywatch_poller.py     — get AW running + poll via aw-client
+4. keystroke_ingestor.py       — pynput queue pattern + win32gui + password redaction
+5. audio_recorder.py           — PyAudioWPatch + silero-vad + faster-whisper pipeline
+6. enrich.py                   — async Claude summarization pass
+7. review_queue (simple HTML)  — list transcripts, assign person, mark done
+8. scheduler.py / main.py      — boots everything, APScheduler with error logging
 ```
