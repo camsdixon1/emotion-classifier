@@ -12,8 +12,6 @@ import time
 import sys
 from datetime import datetime
 
-from pynput import keyboard, mouse
-
 # Buffer keystrokes per-window for this many seconds before flushing
 FLUSH_INTERVAL = 3.0
 
@@ -94,6 +92,7 @@ class InputCapture:
         threading.Thread(target=self._click_worker, daemon=True, name="click-worker").start()
         threading.Thread(target=self._flush_timer, daemon=True, name="flush-timer").start()
 
+        from pynput import keyboard, mouse
         self._key_listener = keyboard.Listener(on_press=self._on_key_press)
         self._mouse_listener = mouse.Listener(on_click=self._on_mouse_click)
         self._key_listener.start()

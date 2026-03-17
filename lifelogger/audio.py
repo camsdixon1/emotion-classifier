@@ -43,6 +43,27 @@ class AudioPipeline:
     def start(self):
         self._running = True
 
+        # Quick check — bail early if no audio hardware at all
+        try:
+            pa_mod, pa = self._get_pyaudio(), None
+            import pyaudiowpatch as _tmp_pa
+        except ImportError:
+            try:
+                import pyaudio as _tmp_pa
+            except ImportError:
+                raise RuntimeError("No audio library available (install PyAudioWPatch or PyAudio)")
+
+        # Test device count with a short-lived PyAudio instance
+        try:
+            _pa_test = _tmp_pa.PyAudio()
+            device_count = _pa_test.get_device_count()
+            _pa_test.terminate()
+        except Exception:
+            device_count = 0
+
+        if device_count == 0:
+            raise RuntimeError("No audio devices found — audio capture unavailable on this system")
+
         # Load models once
         print("[audio] Loading VAD model...")
         self._load_vad()
@@ -100,6 +121,10 @@ class AudioPipeline:
             import pyaudio
             return pyaudio
 
+    def _make_pyaudio(self):
+        pa_mod = self._get_pyaudio()
+        return pa_mod.PyAudio(), pa_mod
+
     def _open_mic_stream(self, pa):
         """Open the default microphone input."""
         return pa.open(
@@ -112,10 +137,13 @@ class AudioPipeline:
 
     def _open_loopback_stream(self, pa):
         """Open the system audio loopback device (Windows WASAPI)."""
-        pyaudio_mod = self._get_pyaudio()
+        try:
+            import pyaudiowpatch as _pam
+        except ImportError:
+            import pyaudio as _pam
 
         try:
-            wasapi_info = pa.get_host_api_info_by_type(pyaudio_mod.paWASAPI)
+            wasapi_info = pa.get_host_api_info_by_type(_pam.paWASAPI)
         except OSError:
             print("[audio] WASAPI not available — loopback disabled")
             return None
@@ -157,8 +185,20 @@ class AudioPipeline:
 
     def _capture_stream(self, source):
         """Capture loop for one audio stream (mic or loopback)."""
-        pyaudio_mod = self._get_pyaudio()
-        pa = pyaudio_mod.PyAudio()
+        try:
+            pa, pyaudio_mod = self._make_pyaudio()
+        except Exception as e:
+            print(f"[audio] {source}: audio backend unavailable — {e}")
+            return
+
+        # Check there are any audio devices before trying to open a stream
+        if pa.get_device_count() == 0:
+            print(f"[audio] {source}: no audio devices found")
+            try:
+                pa.terminate()
+            except Exception:
+                pass
+            return
 
         try:
             if source == "mic":
@@ -168,9 +208,17 @@ class AudioPipeline:
                 stream = self._open_loopback_stream(pa)
                 vad = self._vad_loopback
                 if stream is None:
+                    try:
+                        pa.terminate()
+                    except Exception:
+                        pass
                     return
         except Exception as e:
-            print(f"[audio] Failed to open {source} stream: {e}")
+            print(f"[audio] {source}: failed to open stream — {e}")
+            try:
+                pa.terminate()
+            except Exception:
+                pass
             return
 
         native_rate = getattr(stream, "_native_rate", SAMPLE_RATE)

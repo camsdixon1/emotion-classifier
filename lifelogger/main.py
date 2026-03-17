@@ -23,7 +23,12 @@ def main():
 
     # Start input capture (keystrokes + clicks)
     capture = InputCapture(db)
-    capture.start()
+    try:
+        capture.start()
+    except Exception as e:
+        print(f"[main] Input capture failed to start: {e}")
+        print("[main] Continuing without keystroke/click capture")
+        capture = None
 
     # Start audio pipeline (mic + loopback → VAD → whisper → DB)
     audio = AudioPipeline(db)
@@ -41,7 +46,8 @@ def main():
     # Handle graceful shutdown
     def shutdown(sig, frame):
         print("\n[main] Shutting down...")
-        capture.stop()
+        if capture:
+            capture.stop()
         audio.stop()
         db.stop()
         print("[main] Done.")
